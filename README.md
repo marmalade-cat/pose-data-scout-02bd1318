@@ -1,2 +1,3 @@
-# pose-data-scout-02bd1318
-Pose-Data-Scout [marmalade-project:02bd1318-fbbd-4f48-a637-c34012a9aee7]
+Pose-Data-Scout
+
+Interactive single-file prototype. Paste one or more URLs (one per line) into the Start box, or paste an HTML page into the "Simulate HTML" area to test embedded JSON detection. Click "Run" to fetch pages, follow same-site and first-level outbound links, and report any discovered CSV/JSON files or embedded JSON arrays/objects that look like module poses. CORS may block some fetches in browsers; use simulated HTML for testing.

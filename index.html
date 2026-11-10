@@ -1,0 +1,117 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pose-Data-Scout (prototype)</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:18px;color:#222}
+    textarea{width:100%;height:80px}
+    pre{background:#f6f6f8;padding:8px;border-radius:6px}
+    .row{display:flex;gap:8px;margin:8px 0}
+    button{padding:6px 10px}
+    .card{border:1px solid #ddd;padding:10px;border-radius:6px;margin:8px 0}
+    .small{font-size:0.9em;color:#555}
+  </style>
+</head>
+<body>
+  <h2>Pose-Data-Scout — prototype</h2>
+  <div class="small">By Marmalade, museum cat. Paste target URLs (one per line). You can also paste raw HTML to simulate embedded JSON detection.</div>
+  <label>Start URLs (one per line):</label>
+  <textarea id="urls" placeholder="https://example.com/page1"></textarea>
+  <label>Simulate HTML (optional):</label>
+  <textarea id="simhtml" placeholder="Paste HTML to test embedded JSON detection"></textarea>
+  <div class="row">
+    <button id="run">Run</button>
+    <button id="clear">Clear</button>
+  </div>
+  <div id="log"></div>
+
+<script>
+// Lightweight prototype. Browser fetches may be blocked by CORS; use Simulate HTML to test embedded JSON.
+function log(msg){const d=document.getElementById('log');const p=document.createElement('div');p.className='card';p.innerHTML=msg;d.appendChild(p);}
+
+function sameOrigin(a,b){try{const A=new URL(a), B=new URL(b); return A.origin===B.origin}catch(e){return false}}
+
+async function fetchText(url){try{const r=await fetch(url); if(!r.ok) throw new Error('HTTP '+r.status); const ct=r.headers.get('content-type')||''; const txt=await r.text(); return {text:txt, contentType:ct}; }catch(e){return {error: e.message}} }
+
+function findLinksFromHtml(base, html){const doc=new DOMParser().parseFromString(html,'text/html'); const anchors=Array.from(doc.querySelectorAll('a[href]')); const urls=[]; for(const a of anchors){try{const u=new URL(a.getAttribute('href'), base); urls.push(u.href);}catch(e){} } return Array.from(new Set(urls)); }
+
+function findEmbeddedJson(html){const results=[]; // look for <script type="application/ld+json">, data- attributes, or JSON-looking blocks
+ const doc=new DOMParser().parseFromString(html,'text/html'); const scripts=Array.from(doc.querySelectorAll('script[type="application/ld+json"], script[type="application/json"]'));
+ for(const s of scripts){try{const j=JSON.parse(s.textContent); results.push({source:'script', value:j});}catch(e){}}
+ // try to extract JS assignments: var data = {...};
+ const re=/(?:var|let|const)\s+[a-zA-Z0-9_]+\s*=\s*(\{[\s\S]*?\}|\[[\s\S]*?\]);/g; let m; while((m=re.exec(html))){try{const j=JSON.parse(m[1]); results.push({source:'assignment', value:j});}catch(e){}
+ }
+ return results; }
+
+function isPoseLike(obj){ // heuristic: look for arrays of objects with fields like x,y,z,theta,pose,modules,joints
+ const suggestionFields=['x','y','z','theta','pose','modules','joint_states','joint_state','joint','position','rotation','id','name','type'];
+ if(Array.isArray(obj)){
+   if(obj.length===0) return 0.05;
+   const sample = obj.slice(0,5);
+   let score=0;
+   for(const item of sample){ if(item && typeof item==='object'){ for(const f of Object.keys(item)){ if(suggestionFields.includes(f.toLowerCase())) score+=1; } } }
+   // normalize
+   return Math.min(1, score/(sample.length*2));
+ }
+ if(obj && typeof obj==='object'){
+   // object with keys that might contain arrays
+   let best=0;
+   for(const k of Object.keys(obj)){
+     const v=obj[k]; if(Array.isArray(v)) best=Math.max(best,isPoseLike(v));
+   }
+   return best*0.9;
+ }
+ return 0.01;
+}
+
+function inferSchemaFromArray(arr){ if(!Array.isArray(arr) || arr.length===0) return {fields:[], samples:[]}; const first=arr.find(i=>typeof i==='object')||arr[0]; const fields=first && typeof first==='object'? Object.keys(first):[]; const samples=arr.slice(0,3).map(r=>JSON.stringify(r)); return {fields,samples}; }
+
+async function analyzeUrl(url, originOnly){ const out={url, findings:[]}; const res=await fetchText(url); if(res.error){ out.error=res.error; return out; }
+ // detect downloadable links
+ const ct=res.contentType||'';
+ if(/application\/json|\.json($|;)/i.test(ct) || url.toLowerCase().endsWith('.json')){
+   try{const j=JSON.parse(res.text); const score=isPoseLike(j); const schema=inferSchemaFromArray(Array.isArray(j)?j: (j && typeof j==='object'? (Object.values(j).find(a=>Array.isArray(a))||j):[]));
+     out.findings.push({type:'downloaded-json', confidence:Math.round(score*100), schema:schema, sample:(Array.isArray(j)?JSON.stringify(j.slice(0,3)):JSON.stringify(j))});
+   }catch(e){ out.findings.push({type:'json-parse-error', error:e.message}); }
+ }
+ if(/text\/csv|\.csv($|;)/i.test(ct) || url.toLowerCase().endsWith('.csv')){
+   // simple header sniff
+   const lines=res.text.split(/\r?\n/).filter(Boolean);
+   const header=lines[0]||''; const cols=header.split(',').map(s=>s.trim()); out.findings.push({type:'downloaded-csv', confidence:20, schema:{fields:cols}, sample:lines.slice(1,4)});
+ }
+ // if html, search embedded json
+ if(/text\/html|<html/i.test(ct) || url.toLowerCase().endsWith('.htm')){
+   const embeds=findEmbeddedJson(res.text);
+   for(const e of embeds){ const score=isPoseLike(e.value); const arr=Array.isArray(e.value)?e.value: (e.value && typeof e.value==='object'? (Object.values(e.value).find(a=>Array.isArray(a))||e.value):[]); const schema=inferSchemaFromArray(arr); out.findings.push({type:'embedded-json', source:e.source, confidence:Math.round(score*100), schema, sample: schema.samples}); }
+ }
+ // find outbound links for first-level crawl
+ if(/text\/html|<html/i.test(ct) || url.toLowerCase().endsWith('.htm')){
+   const links=findLinksFromHtml(url, res.text);
+   const same=[]; const outbound=[];
+   for(const l of links){ if(sameOrigin(url,l)) same.push(l); else outbound.push(l); }
+   // keep only first-level outbound up to 8
+   out.sameSite=Array.from(new Set(same)).slice(0,8);
+   out.outbound=Array.from(new Set(outbound)).slice(0,8);
+ }
+ return out;
+}
+
+async function runAll(){ document.getElementById('log').innerHTML=''; const raw=document.getElementById('urls').value.trim(); const sim=document.getElementById('simhtml').value; const starts=raw? raw.split(/\r?\n/).map(s=>s.trim()).filter(Boolean):[];
+ if(starts.length===0 && !sim){ log('<b>No start URLs and no simulated HTML provided.</b>'); return; }
+ // If simulated HTML provided, create a pseudo-url and analyze it
+ if(sim){ log('<b>Analyzing simulated HTML (no network)</b>'); const fakeUrl='https://simulated.local/page.html'; const out=await (async ()=>{ const obj={url:fakeUrl, findings:[]}; const embeds=findEmbeddedJson(sim); for(const e of embeds){ const score=isPoseLike(e.value); const arr=Array.isArray(e.value)?e.value: (e.value && typeof e.value==='object'? (Object.values(e.value).find(a=>Array.isArray(a))||e.value):[]); const schema=inferSchemaFromArray(arr); obj.findings.push({type:'embedded-json', source:e.source, confidence:Math.round(score*100), schema, sample:schema.samples}); } return obj; })(); renderResult(out); }
+ for(const s of starts){ log('<b>Fetching:</b> '+s); try{ const r=await analyzeUrl(s); renderResult(r); // follow same-site and first-level outbound
+     const toFollow=(r.sameSite||[]).concat((r.outbound||[]).slice(0,5)); for(const f of toFollow){ log('Following: '+f); const r2=await analyzeUrl(f); renderResult(r2); }
+   }catch(e){ log('Error: '+e.message); }
+ }
+}
+
+function renderResult(r){ if(r.error){ log('<div><b>'+r.url+'</b> — error: '+r.error+'</div>'); return; } const parts=[]; parts.push('<div><b>'+r.url+'</b></div>'); if(r.findings && r.findings.length){ for(const f of r.findings){ parts.push('<div class="small">Type: '+f.type+'; Confidence: '+(f.confidence||0)+'%</div>'); if(f.schema){ parts.push('<div class="small">Fields: '+(f.schema.fields.join(', ')||'(none)')+'</div>'); parts.push('<pre>'+ (f.sample? (Array.isArray(f.sample)? f.sample.join('\n') : f.sample) : '') +'</pre>'); } if(f.error) parts.push('<div class="small">Error: '+f.error+'</div>'); } } else parts.push('<div class="small">No embedded/downloadable JSON or CSV detected.</div>'); if(r.sameSite) parts.push('<div class="small">Same-site links: '+r.sameSite.length+'</div>'); if(r.outbound) parts.push('<div class="small">Outbound links: '+r.outbound.length+'</div>'); log(parts.join('\n'));
+}
+
+document.getElementById('run').addEventListener('click',runAll);
+document.getElementById('clear').addEventListener('click',()=>document.getElementById('log').innerHTML='');
+</script>
+</body>
+</html>
